@@ -1,6 +1,5 @@
 print "Loading libraries..."
-import os, sys, zlib, Queue, urllib2, threading, signal, re
-signal.signal(signal.SIGINT, lambda a,b: exit(0))
+import os, sys, zlib, multiprocessing, urllib2, threading, signal, re, traceback, urllib
 
 # Requires installation
 import lxml.etree
@@ -56,57 +55,68 @@ def archive_sequences():
 				gene_seq = gene_seq + line.strip()
 # archive_sequences()
 
-q = Queue.Queue()
+q = multiprocessing.JoinableQueue()
 number_enqueued_tasks = 0 # We have to count this ourselves, WTF
 number_tasks_done = 0
 def start_workers(num_workers):
 	sys.stdout.write("Starting workers...\n")
 	sys.stdout.flush()
 	def worker():
-		global number_enqueued_tasks
-		global number_tasks_done
-		while True:
-			fractn = number_tasks_done * 100. / (number_enqueued_tasks+.01)
-			print "\x1B[1FProcessing queue: %i%% (%i/%i)"%(int(fractn), number_tasks_done, number_enqueued_tasks)
-			item = q.get()
-			success = item()
-			q.task_done()
-			if success:
-				number_tasks_done += 1
-			else:
-				q.put(item)
+		try:
+			global number_enqueued_tasks
+			global number_tasks_done
+			while True:
+				fractn = number_tasks_done * 100. / (number_enqueued_tasks+.01)
+				print "\x1B[1FProcessing queue: %i%% (%i/%i)"%(int(fractn), number_tasks_done, number_enqueued_tasks)
+				item = q.get()
+				success = perform_uniprot_search(item)
+				q.task_done()
+				if success:
+					number_tasks_done += 1
+				else:
+					q.put(item)
+		except EOFError:
+			return
 	for i in range(num_workers):
 		t = threading.Thread(target=worker)
 		t.daemon = True
 		t.start()
 start_workers(8)
 
-def convert_ensembl_to_uniprot():
-	def perform_uniprot_search(ensembl_name):
+def perform_uniprot_search(ensembl_name):
+	try:
+		url = 'http://www.uniprot.org/uniprot/?query=%s&sort=score&format=xml'%urllib.quote(ensembl_name)
+		xmldoc = urllib2.urlopen(url).read()
 		try:
-			print "a"
-			xmldoc = urllib2.urlopen('http://www.uniprot.org/uniprot/?query=%s&sort=score&format=xml'%ensembl_name).read()
-			print "b"
 			xmltree = lxml.etree.fromstring(xmldoc)
-			print "c"
-			uni_ids = xmltree.xpath('//up:entry[@dataset="Swiss-Prot"]/up:accession/text()',namespaces={'up':'http://uniprot.org/uniprot'})
-			print "d"
-			row = {'ensembl_name':ensembl_name}
-			print "upd"
-			genes.update(row,{'$set':{'uniprot_id':uni_ids[0], 'all_uniprot_ids':' '.join(uni_ids)}})
 		except Exception as e:
-			print "Exception searching for %s: %s"%(ensembl_name,e)
-			sys.stdout.flush()
-			return False
+			print "Parsing %s failed.\n"%url
+			return True
+		uni_ids = xmltree.xpath('//up:entry[@dataset="Swiss-Prot"]/up:accession/text()',namespaces={'up':'http://uniprot.org/uniprot'})
+		row = {'ensembl_name':ensembl_name}
+		newkeys = {'uniprot_id':uni_ids[0], 'all_uniprot_ids':' '.join(uni_ids)}
+		genes.update(row,{'$set':newkeys})
+	except Exception as e:
+		print "Exception searching for %s: %s"%(ensembl_name,e)
+		traceback.print_exc(10)
 		sys.stdout.flush()
-		return True
+		return False
+	sys.stdout.flush()
+	return True
+def convert_ensembl_to_uniprot():
 	print "Converting ensembl to uniprot..."
 	for row in genes.find({'uniprot_id':None}):
 		global number_enqueued_tasks
 		number_enqueued_tasks += 1
-		q.put(lambda: perform_uniprot_search(row['ensembl_name']))
+		q.put(row['ensembl_name'])
 convert_ensembl_to_uniprot()
-q.join()
+
+try:
+	q.join()
+except KeyboardInterrupt as e:
+	print "Ctrl-C Pressed."
+	traceback.print_exc(10)
+	exit(0)
 
 def create_clustal_in():
 	if not os.path.isdir('clustalin'):
