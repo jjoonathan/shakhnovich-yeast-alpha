@@ -219,7 +219,7 @@ def create_clustal_ids():
 	for group in ortholog_groups.find():
 		ortholog_groups.update({"_id":group['_id']}, {'$set':{'clustal_id':i}})
 		i += 1
-create_clustal_ids()
+#create_clustal_ids()
 
 def create_clustal_in():
 	print "Writing clustal input files..."
@@ -244,4 +244,11 @@ def create_clustal_in():
 			infile = open(indir+'/%i.fasta'%orthogrp['clustal_id'],'w')
 			infile.write('\n'.join(ingenes))
 			infile.close()
-create_clustal_in()
+#create_clustal_in()
+
+def read_clustalout():
+	for species2 in ['paradoxus', 'mikatae', 'bayanus']:
+		outdir = 'clustalout-'+species2
+		mkout
+		for fname in os.listdir(outdir):
+			
