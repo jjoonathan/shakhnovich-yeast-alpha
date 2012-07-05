@@ -1,10 +1,13 @@
 print "Loading libraries..."
 import os, sys, zlib, multiprocessing, threading, signal, re, traceback, urllib, eventlet, httplib
+import itertools
 
 # Requires installation
 import lxml.etree
 import pymongo
 from eventlet.green import urllib2
+import eventlet.green.subprocess as gsub
+import MySQLdb
 
 species1 = 'cerevisiae'
 species2 = 'paradoxus'
@@ -15,10 +18,12 @@ sys.stdout.flush()
 connection = pymongo.Connection('localhost',27017)
 genes = connection[run_name]['genes']
 ortholog_groups = connection[run_name]['ortholog_groups']
+avals = connection[run_name]['avals']
 # genes.ensure_index("ensembl_name", unique=True, sparse=True)
 genes.ensure_index("local_name")
 genes.ensure_index("uniprot_id")
 ortholog_groups.ensure_index("cerevisiae")
+ortholog_groups.ensure_index("clustal_id")
 
 cell_idx_to_species = ['cerevisiae', 'paradoxus', 'mikatae', 'bayanus']
 def update_orthology():
@@ -246,9 +251,187 @@ def create_clustal_in():
 			infile.close()
 #create_clustal_in()
 
-def read_clustalout():
+def run_mktest():
+	print "Running MKtest..."
 	for species2 in ['paradoxus', 'mikatae', 'bayanus']:
-		outdir = 'clustalout-'+species2
-		mkout
-		for fname in os.listdir(outdir):
-			
+		indir = 'clustalout-'+species2+'/'
+		outdir = 'mkout-'+species2+'/'
+		if not os.path.isdir(outdir):
+			os.mkdir(outdir)
+		mktest_pool = eventlet.greenpool.GreenPool(size=4)
+		infiles = [indir+s for s in os.listdir(indir)]
+		for result in mktest_pool.imap(run_1_mktest, infiles, itertools.repeat(outdir)):
+			pass
+def run_1_mktest(infile_path, outdir):
+	sys.stdout.write('.')
+	sys.stdout.flush()
+	infile_name = os.path.basename(infile_path)
+	clustal_id = int(infile_name.split('.')[0])
+	geneGroup = ortholog_groups.find_one({'clustal_id':clustal_id})
+	n = len(geneGroup['cerevisiae'])
+	args = ('MKtest','-i',infile_path,'-n',str(n))
+	ofile = open(outdir+infile_name,'w')
+	try:
+		proc = gsub.Popen(args, stdout=ofile, stderr=ofile)
+		proc.wait()
+	except OSError as e:
+		print "MKtest error: %s"%e
+	ofile.close()
+# run_mktest()
+
+def retrieve_alpha():
+	print "Gathering MKtest output..."
+	for species2 in ['paradoxus', 'mikatae', 'bayanus']:
+		mkout_dir = 'mkout-'+species2
+		for f in os.listdir(mkout_dir):
+			clustal_id = int(f.split('.')[0])
+			f = mkout_dir + '/' + f
+			mkstr = open(f).read()
+			fixedAS = re.findall('#Fixed\s+(\d+)\s+(\d+)', mkstr)
+			polyAS  = re.findall('#Poly\s+(\d+)\s+(\d+)', mkstr)
+			if len(fixedAS) != 1:
+				sys.stderr.write("File %s has %i #Fixed lines\n"%(f,len(fixedAS)))
+				continue
+			if len(polyAS) != 1:
+				sys.stderr.write("File %s has %i #Poly lines\n"%(f,len(polyAS)))
+				continue
+			Dn, Ds = [float(s) for s in fixedAS[0]]
+			Pn, Ps = [float(s) for s in polyAS[0]]
+			aval_id = {'clustal_id':clustal_id, 'species2':species2}
+			aval_entry = {'Dn':Dn, 'Ds':Ds, 'Pn':Pn, 'Ps':Ps}
+			# aval_entry.update(aval_id)
+			if 0 not in (Pn, Ps, Dn, Ds):
+				aval_entry['a'] = 1-((Pn*1.0/Ps)/(Dn*1.0/Ds))
+			avals.update(aval_id, {'$set':aval_entry}, upsert=True)
+			ortholog_groups.update({'clustal_id':clustal_id}, {'$set':{(species2+'-a'):aval_entry}})
+# retrieve_alpha()
+
+
+def go_fetch(orthogrp, trynum):  # g is a uniprot identifier
+    try:
+	    fetchurl = 'http://www.uniprot.org/uniprot/%s.xml'%(orthogrp['cerevisiae'][trynum])
+    except IndexError:
+	    print "Orthology group %i has no cerevisiae UniProt IDs."%orthogrp['clustal_id']
+	    return "FAIL"
+    try:
+	response = urllib2.urlopen(fetchurl).read()
+	xmldoc = lxml.etree.fromstring(response)
+	xmlns = {'up':'http://uniprot.org/uniprot'}
+	go_tags = xmldoc.xpath('//up:dbReference[@type="GO"]/@id',namespaces=xmlns)
+	if len(go_tags)==0:
+	    # print "Error: Orthology group %i had no associated go tags."%orthogrp['clustal_id']
+	    return "RETRY"
+    except (urllib2.HTTPError, httplib.BadStatusLine) as e:
+	print "Error '%s'->%s"%(fetchurl,e)
+	return "RETRY"
+    ortholog_groups.update({'_id':orthogrp['_id']},{'$set':{'go_tags':go_tags}})
+    return "SUCCESS"
+def run_go_fetch(orthogrp):  # gene is a db row
+	result = "RETRY"
+	trynum = 0
+	while True:
+		result = go_fetch(orthogrp, trynum)
+		if result != "RETRY":
+			break
+		trynum += 1
+	return result != "FAIL"
+def fetch_go_tags_from_uniprot():
+	print "Fetching new genes...\n"
+	ortho_grps = ortholog_groups.find({'go_tags':None})
+	num = ortho_grps.count()
+	downloader_pool = eventlet.greenpool.GreenPool(size=8)
+	i=0
+	for result in downloader_pool.imap(run_go_fetch, ortho_grps):
+		i += 1
+		print "\x1B[1F%i%% (%i/%i)"%(int(i*100./num),i,num)
+# fetch_go_tags_from_uniprot()
+
+def compute_go_annotations():
+	""" Needs the geneontology.org DB in mysql, default port, user, host, DB name 'go' """
+	print "Computing go annotations...\n"
+	conn = MySQLdb.Connection()
+	c = conn.cursor()
+	c.execute('USE go;')
+	orthogrps = ortholog_groups.find({'go_tags':{'$exists':True}})
+	i, num = 0, orthogrps.count()
+	for orthogrp in orthogrps:
+		annotations = set()
+		i += 1
+		print "\x1B[1F%i%% (%i/%i)"%(int(i*100./num),i,num)
+		for gotag in orthogrp['go_tags']:
+			c.execute("""
+SELECT DISTINCT
+        ancestor.name, 
+        ancestor.acc
+ FROM 
+  term
+  INNER JOIN graph_path ON (term.id=graph_path.term2_id)
+  INNER JOIN term AS ancestor ON (ancestor.id=graph_path.term1_id)
+ WHERE term.acc='%s';"""%gotag)
+			for annotation_name, annotation_gotag in c.fetchall():
+				annotations.add(annotation_name)
+		ortholog_groups.update({'_id':orthogrp['_id']},{'$set':{'go_annotations':list(annotations)}})
+# compute_go_annotations()
+
+def copy_go_annotations_to_avals():
+	for aval in avals.find({'go_annotations':None}):
+		grp = ortholog_groups.find_one({'clustal_id':aval['clustal_id']})
+		try:
+			avals.update({'_id':aval['_id']}, {'$set':{'go_annotations':grp['go_annotations']}})
+		except KeyError:
+			print "No GO annotations for %s.%i"%(aval['species2'],aval['clustal_id'])
+# copy_go_annotations_to_avals()
+
+def compute_family_lengths():
+	for ogrp in ortholog_groups.find({'length':None,'cerevisiae':{'$exists':True}}):
+		local_ids = [ogrp.get(k,None) for k in ('paradoxus','mikatae','bayanus')]
+		for lid in local_ids:
+			if lid==None:
+				continue
+			gene = genes.find_one({'local_name':lid})
+			if 'orf' not in gene:
+				continue
+			ortholog_groups.update({'_id':ogrp['_id']}, {'$set':{'length':len(gene['orf'])}})
+# compute_family_lengths()		
+
+def find_enriched_tags():
+	tag_count = dict()
+	tag_count_a_lt_0 = dict()
+	for aval in avals.find({'a':{'$exists':True}, 'go_annotations':{'$exists':True}}):
+		if aval['a'] < 0:
+			for tag in aval['go_annotations']:
+				newval = tag_count_a_lt_0.get(tag,0) + 1
+				tag_count_a_lt_0[tag] = newval
+		for tag in aval['go_annotations']:
+			newval = tag_count.get(tag,0) + 1
+			tag_count[tag] = newval
+	enrichments = []
+	for annotation in (set(tag_count.keys()).intersection(set(tag_count_a_lt_0.keys()))):
+		background_count = tag_count[annotation]
+		foreground_count = tag_count_a_lt_0[annotation]
+		enrichment = foreground_count*1.0 / background_count
+		enrichments.append((enrichment,foreground_count,background_count,annotation))
+	enrichments.sort()
+	enrichments.reverse()
+	print "Enrichment, Foreground_Count, Background_Count, Annotation_Name"
+	print '\n'.join(str(tup) for tup in enrichments[:100])
+find_enriched_tags()
+
+def output_alpha():
+	for species2 in ['paradoxus', 'mikatae', 'bayanus']:
+		ofname = 'alpha-cerevisiae-%s.txt'%species2
+		f = open(ofname,'w')
+		print "Writing %s..."%ofname
+		f.write("cerevisiae_gene\tclustal_id\tDn\tDs\tPn\tPs\ta\n")
+		for entry in avals.find({'species2':species2}):
+			clustal_id = entry['clustal_id']
+			Dn, Ds, Pn, Ps = [str(entry[key]) for key in ('Dn', 'Ds', 'Pn', 'Ps')]
+			try:
+				a = str(entry['a'])
+			except KeyError:
+				a = ''
+			family = ortholog_groups.find_one({'clustal_id':clustal_id})
+			f.write('\t'.join((family['cerevisiae'][0], str(clustal_id), Dn, Ds, Pn, Ps, a)))
+			f.write('\n')
+		f.close()
+# output_alpha()
